@@ -192,11 +192,9 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False,
             print_iter=100, print_progress=False, ltPrior=None, lsPrior=None, 
             sigmaPrior=None, noisePrior=None, mh_sd_r=None, kern=None):
     """
-    Run the ZINB NNGP model described in https://doi.org/10.1016/j.jspi.2023.106098.
+    Run the ZINB NNGP model.
+    Includes numerical stability fixes and strict type casting for Python.
     """
-    # TODO: Break down the Gibbs sampling and test all steps independently
-    # TODO: Remove the need to compute Ds, Dt manually, take in coords for both instead so you can NNGP with large datasets
-
     # X is the design matrix with dimension N*p
     # x is the vector with length N
     # y is the count response with length N
@@ -206,9 +204,7 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False,
     n_time_points = Vt.shape[1]
 
     # Sacrifice to the intercept gods
-    # Ds <- Ds[2:nrow(Ds), 2:ncol(Ds)]
     Ds = Ds[1:, 1:]
-    # Dt <- Dt[2:nrow(Dt), 2:ncol(Dt)]
     Dt = Dt[1:, 1:]
 
     # Use squared distances
@@ -226,7 +222,6 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False,
     ##########
 
     ####### priors for alpha and beta ######
-    # T0a <- T0b <- diag(100, p)
     T0a = np.eye(p) * 100
     T0b = np.eye(p) * 100
     sd_r = nullcheck(mh_sd_r, 0.4)
@@ -238,51 +233,40 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False,
     noisePrior = nullcheck(noisePrior, {'a': 1.5, 'b': 1.5, 'mh_sd': 0.2})
 
     # Model init
-    r = 1
+    r = 1.0 # Ensure r is float
     y1 = np.zeros(N) # At risk indicator (this is W in paper)
     y1[y > 0] = 1 # If y>0, then at risk w.p. 1
-    # q <- rep(.5, N) 
 
     #########
     # Inits #
     #########
 
- #################
+    #################
     # Fixed Effects #
     #################
-    y_ind = np.zeros(N) # convert y to a two class indicator and use logistic regression
+    y_ind = np.zeros(N) 
     y_ind[y != 0] = 1
 
-    # m1 (Binomial) usually does NOT add extra params, so this remains safe
     m1 = sm.GLM(y_ind, X, family=Binomial()).fit()
     alpha1 = m1.params
 
-    # m2 (Negative Binomial)
-    # Note: X[y != 0, ] syntax in Python requires boolean indexing on rows
     mask_nz = (y != 0)
-    
-    # Check if we have data to fit
     if np.sum(mask_nz) > 0:
         m2 = NegativeBinomial(y[mask_nz], X[mask_nz], loglike_method='nb2').fit(disp=0)
-        # FIX: Slice off the last parameter (the dispersion parameter alpha)
-        # statsmodels appends the dispersion parameter at the end of .params
         beta = m2.params[:-1] 
     else:
-        # Fallback if no non-zeros (unlikely in real data but possible in smoke test)
         beta = np.zeros(p)
 
     eta1 = X @ alpha1 + 0
     eta2 = X @ beta + 0 
-    p_at_risk = sigmoid(eta1) # at-risk probability
+    p_at_risk = sigmoid(eta1) 
 
     q = 1 / (1 + np.exp(eta2))
     theta = p_at_risk * (q**r) / (p_at_risk * (q**r) + 1 - p_at_risk) 
-    # y1[y == 0] <- rbinom(sum(y == 0), 1, theta[y == 0]) 
+    
     mask_z = (y == 0)
     y1[mask_z] = np.random.binomial(1, theta[mask_z])
 
-    # m1 <- glm(y1 ~ 0 + X, family = "binomial")
-    # alpha <- as.matrix(m1$coefficients)
     m1 = sm.GLM(y1, X, family=Binomial()).fit()
     alpha = m1.params
 
@@ -294,10 +278,10 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False,
     ##########################
     # Spatial Random Effects #
     ##########################
-    l1s = l2s = 1
-    sigma1s = sigma2s = 2
+    l1s = l2s = 1.0
+    sigma1s = sigma2s = 2.0
     Ks_bin = sigma1s**2 * noise_mix(kern(Ds, l1s), noise_ratio_s1)
-    Ks_bin_inv = np.linalg.solve(Ks_bin, np.eye(Ks_bin.shape[0])) # forceSymmetric implicit
+    Ks_bin_inv = np.linalg.solve(Ks_bin, np.eye(Ks_bin.shape[0])) 
     Ks_bin_inv = (Ks_bin_inv + Ks_bin_inv.T) / 2
 
     Ks_nb = sigma2s**2 * noise_mix(kern(Ds, l2s), noise_ratio_s2)
@@ -310,8 +294,8 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False,
     #################
     # Temporal Random Effects #
     #################
-    sigma1t = sigma2t = 2
-    l1t = l2t = 1
+    sigma1t = sigma2t = 2.0
+    l1t = l2t = 1.0
     Kt_bin = sigma1t**2 * noise_mix(kern(Dt, l1t), noise_ratio_t1)
     Kt_bin_inv = np.linalg.solve(Kt_bin, np.eye(Kt_bin.shape[0]))
     Kt_bin_inv = (Kt_bin_inv + Kt_bin_inv.T) / 2
@@ -326,31 +310,28 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False,
     ############
     # Num Sims #
     ############
-    lastit = int((nsim - burn) / thin) # Last stored value
+    lastit = int((nsim - burn) / thin) 
 
     #########
     # Store #
     #########
     Beta = np.zeros((lastit, p))
     Alpha = np.zeros((lastit, p))
-    R_store = np.zeros(lastit) # Renamed to avoid confusion with variable 'r'
+    R_store = np.zeros(lastit) 
     A = np.zeros((lastit, n))
     C = np.zeros((lastit, n))
     B = np.zeros((lastit, n_time_points))
-    D_store = np.zeros((lastit, n_time_points)) # Renamed
+    D_store = np.zeros((lastit, n_time_points)) 
 
     L1t = np.zeros(lastit)
     Sigma1t = np.zeros(lastit)
     Noise1t = np.zeros(lastit)
-    
     L2t = np.zeros(lastit)
     Sigma2t = np.zeros(lastit)
     Noise2t = np.zeros(lastit)
-    
     L1s = np.zeros(lastit)
     Sigma1s = np.zeros(lastit)
     Noise1s = np.zeros(lastit)
-    
     L2s = np.zeros(lastit)
     Sigma2s = np.zeros(lastit)
     Noise2s = np.zeros(lastit)
@@ -365,108 +346,99 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False,
     ########
     # MCMC #
     ########
-    # XV <- cbind(X, Vs, Vt)
     XV = np.hstack((X, Vs, Vt))
     
     for i in range(1, nsim + 1):
-        # Ensure these are all updated from last iteration
-        # Sigma0_bin.inv <- as.matrix(bdiag(Ks_bin_inv, Kt_bin_inv))
+        # Update priors
         Sigma0_bin_inv = block_diag(Ks_bin_inv, Kt_bin_inv)
-        
-        # Sigma0_nb.inv <- as.matrix(bdiag(Ks_nb_inv, Kt_nb_inv))
         Sigma0_nb_inv = block_diag(Ks_nb_inv, Kt_nb_inv)
-        
-        # T0_bin <- as.matrix(bdiag(T0a, Sigma0_bin.inv))
         T0_bin = block_diag(T0a, Sigma0_bin_inv)
-        # T0_nb <- as.matrix(bdiag(T0b, Sigma0_nb.inv))
         T0_nb = block_diag(T0b, Sigma0_nb_inv)
 
-        # Update latent variable z
+        # -----------------------------------------------------
+        # Update alpha, a, b (Logistic Component)
+        # -----------------------------------------------------
         mu = X @ alpha + Vs @ a + Vt @ b
-        # w <- rpg(N, 1, mu[, 1])
-        w = rpg(N, 1, mu) # Assumes mu is vector
-        z = (y1 - 1 / 2) / w
-
-        # Update alpha, a, b
-        # svd_vinv <- svd(crossprod(sqrt(w) * XV) + T0_bin)
+        w = rpg(N, 1, mu) 
+        
+        # NOTE: We skip calculating 'z' directly to avoid divide-by-zero errors when w is small.
+        # Instead, we use the algebraic identity: X' W z = X' (y - 1/2)
+        # Old (unstable): z = (y1 - 1 / 2) / w
+        
         sqrt_w_XV = np.sqrt(w)[:, None] * XV
         crossprod_val = sqrt_w_XV.T @ sqrt_w_XV
         svd_vinv_u, svd_vinv_s, svd_vinv_v = np.linalg.svd(crossprod_val + T0_bin)
-        svd_vinv = {'u': svd_vinv_u, 'd': svd_vinv_s, 'v': svd_vinv_v.T} # Pack for utils functions
+        svd_vinv = {'u': svd_vinv_u, 'd': svd_vinv_s, 'v': svd_vinv_v.T}
 
-        # m <- solve_svd(svd_vinv, (t(sqrt(w) * XV) %*% (sqrt(w) * z)))
-        rhs = (sqrt_w_XV.T @ (np.sqrt(w) * z))
+        # Stable calculation for RHS: XV.T @ (y1 - 0.5)
+        rhs = XV.T @ (y1 - 0.5)
         m = solve_svd(svd_vinv, rhs)
         
-        # alphaab <- c(mvn_sample_svd(svd_vinv, m))
         alphaab = mvn_sample_svd(svd_vinv, m)
-        
         alpha = alphaab[0:p]
         a = alphaab[p:(p + n)]
         b = alphaab[(p + n):]
 
-        # Update at-risk indicator y1 (W in paper)
+        # -----------------------------------------------------
+        # Update at-risk indicator y1
+        # -----------------------------------------------------
         eta1 = X @ alpha + Vs @ a + Vt @ b
-        eta2 = X @ beta + Vs @ c + Vt @ d # Use all n observations
-        pi_val = sigmoid(eta1) # at-risk probability
-        q = 1 / (1 + np.exp(eta2)) # Pr(y=0|y1=1)
-        theta = pi_val * (q**r) / (pi_val * (q**r) + 1 - pi_val) # Conditional prob that y1=1 given y=0
+        eta2 = X @ beta + Vs @ c + Vt @ d 
+        pi_val = sigmoid(eta1) 
+        q = 1 / (1 + np.exp(eta2)) 
+        theta = pi_val * (q**r) / (pi_val * (q**r) + 1 - pi_val) 
         
         mask_z = (y == 0)
         y1[mask_z] = np.random.binomial(1, theta[mask_z])
-        N1 = np.sum(y1)
-
-        # Update r, TODO: Check this.
-        rnew = rtnorm(1, r, sd_r, lower=0, upper=np.inf)[0] # Treat r as continuous
         
-        # ratio calculation
-        # sum(dnbinom(y[y1 == 1], rnew, q[y1 == 1], log = TRUE))
+        # FIX: Ensure N1 is an integer for rpg()
+        N1 = int(np.sum(y1))
+
+        # -----------------------------------------------------
+        # Update r
+        # -----------------------------------------------------
+        rnew = rtnorm(1, r, sd_r, lower=0, upper=np.inf)[0]
         mask_y1 = (y1 == 1)
-        ll_new = np.sum(nbinom.logpmf(y[mask_y1], rnew, 1 - q[mask_y1])) # nbinom(n, p) where p is prob of success
-        ll_old = np.sum(nbinom.logpmf(y[mask_y1], r, 1 - q[mask_y1]))
         
-        ratio = ll_new - ll_old + \
-            dtnorm(r, rnew, sd_r, 0, np.inf, log=True) - \
-            dtnorm(rnew, r, sd_r, 0, np.inf, log=True)
-        
-        # Proposal not symmetric
-        if np.log(uniform.rvs()) < ratio:
-            r = rnew
+        # Check if we have any at-risk population
+        if np.sum(mask_y1) > 0:
+            ll_new = np.sum(nbinom.logpmf(y[mask_y1], rnew, 1 - q[mask_y1]))
+            ll_old = np.sum(nbinom.logpmf(y[mask_y1], r, 1 - q[mask_y1]))
+            
+            ratio = ll_new - ll_old + \
+                dtnorm(r, rnew, sd_r, 0, np.inf, log=True) - \
+                dtnorm(rnew, r, sd_r, 0, np.inf, log=True)
+            
+            if np.log(uniform.rvs()) < ratio:
+                r = rnew
 
-        # update l1t, sigma1t, noise_ratio_t1
+        # -----------------------------------------------------
+        # Update Hyperparams (Logistic)
+        # -----------------------------------------------------
         out = update_ls_sigma_noise(l1t, sigma1t, noise_ratio_t1, b, Kt_bin, Dt, ltPrior, sigmaPrior, noisePrior, kern)
-        l1t = out['ls']
-        sigma1t = out['sigma']
-        noise_ratio_t1 = out['noise_ratio']
-        Kt_bin = out['K']
-        Kt_bin_inv = out['K_inv']
+        l1t, sigma1t, noise_ratio_t1 = out['ls'], out['sigma'], out['noise_ratio']
+        Kt_bin, Kt_bin_inv = out['K'], out['K_inv']
 
-        # update l1s, sigma1s, noise_ratio_s1
         out = update_ls_sigma_noise(l1s, sigma1s, noise_ratio_s1, a, Ks_bin, Ds, lsPrior, sigmaPrior, noisePrior, kern)
-        l1s = out['ls']
-        sigma1s = out['sigma']
-        noise_ratio_s1 = out['noise_ratio']
-        Ks_bin = out['K']
-        Ks_bin_inv = out['K_inv']
+        l1s, sigma1s, noise_ratio_s1 = out['ls'], out['sigma'], out['noise_ratio']
+        Ks_bin, Ks_bin_inv = out['K'], out['K_inv']
 
-        # Update beta
-        # eta <- X[y1 == 1, ] %*% beta + Vs[y1 == 1, ] %*% c + Vt[y1 == 1, ] %*% d
-        mask_y1 = (y1 == 1)
+        # -----------------------------------------------------
+        # Update beta, c, d (Count Component)
+        # -----------------------------------------------------
         eta = X[mask_y1] @ beta + Vs[mask_y1] @ c + Vt[mask_y1] @ d
-        
-        # w <- rpg(N1, y[y1 == 1] + r, eta) # Polya weights
         w = rpg(N1, y[mask_y1] + r, eta)
-        z = (y[mask_y1] - r) / (2 * w)
+        
+        # Stable calculation: X' W z = X' (y - r)/2
+        # Old (unstable): z = (y[mask_y1] - r) / (2 * w)
 
-        # Update beta, c, d
-        # svd_vinv <- svd(crossprod(sqrt(w) * XV[y1 == 1, ]) + T0_nb)
         sqrt_w_XV_sub = np.sqrt(w)[:, None] * XV[mask_y1]
         crossprod_val = sqrt_w_XV_sub.T @ sqrt_w_XV_sub
         svd_vinv_u, svd_vinv_s, svd_vinv_v = np.linalg.svd(crossprod_val + T0_nb)
         svd_vinv = {'u': svd_vinv_u, 'd': svd_vinv_s, 'v': svd_vinv_v.T}
 
-        # m <- solve_svd(svd_vinv, (t(sqrt(w) * XV[y1 == 1, ]) %*% (sqrt(w) * z)))
-        rhs = sqrt_w_XV_sub.T @ (np.sqrt(w) * z)
+        # Stable calculation for RHS
+        rhs = XV[mask_y1].T @ (0.5 * (y[mask_y1] - r))
         m = solve_svd(svd_vinv, rhs)
         
         betacd = mvn_sample_svd(svd_vinv, m)
@@ -474,30 +446,25 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False,
         c = betacd[p:(p + n)]
         d = betacd[(p + n):]
 
-        # update l2t, sigma2t, noise_ratio_t2
+        # -----------------------------------------------------
+        # Update Hyperparams (Count)
+        # -----------------------------------------------------
         out = update_ls_sigma_noise(l2t, sigma2t, noise_ratio_t2, d, Kt_nb, Dt, ltPrior, sigmaPrior, noisePrior, kern)
-        l2t = out['ls']
-        sigma2t = out['sigma']
-        noise_ratio_t2 = out['noise_ratio']
-        Kt_nb = out['K']
-        Kt_nb_inv = out['K_inv']
+        l2t, sigma2t, noise_ratio_t2 = out['ls'], out['sigma'], out['noise_ratio']
+        Kt_nb, Kt_nb_inv = out['K'], out['K_inv']
 
-        # update l2s, sigma2s, noise_ratio_s2
         out = update_ls_sigma_noise(l2s, sigma2s, noise_ratio_s2, c, Ks_nb, Ds, lsPrior, sigmaPrior, noisePrior, kern)
-        l2s = out['ls']
-        sigma2s = out['sigma']
-        noise_ratio_s2 = out['noise_ratio']
-        Ks_nb = out['K']
-        Ks_nb_inv = out['K_inv']
+        l2s, sigma2s, noise_ratio_s2 = out['ls'], out['sigma'], out['noise_ratio']
+        Ks_nb, Ks_nb_inv = out['K'], out['K_inv']
 
+        # -----------------------------------------------------
         # Store
+        # -----------------------------------------------------
         if (i > burn) and ((i - burn) % thin == 0):
-            # j <- (i - burn) / thin
-            j = int((i - burn) / thin) - 1 # 0-indexed storage
+            j = int((i - burn) / thin) - 1 
             
             Alpha[j, :] = alpha
-            Beta[j, :] = beta # fixed effects
-
+            Beta[j, :] = beta 
             A[j, :] = a
             B[j, :] = b
             C[j, :] = c
