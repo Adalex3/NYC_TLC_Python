@@ -25,8 +25,11 @@ def run_model_with_taxi_data(csv_path: str):
         logging.error(f"Data file not found at {csv_path}. Please update the path.")
         return
 
-    # For consistency, let's sort the dataframe early
-    df = df.sort_values(by=['grid_x', 'grid_y', 'hour']).reset_index(drop=True)
+    # Create a combined time identifier (0-23 for weekday, 24-47 for weekend)
+    df['time_id'] = df['hour'] + 24 * df['is_weekend']
+
+    # For consistency, sort the dataframe early
+    df = df.sort_values(by=['grid_x', 'grid_y', 'time_id']).reset_index(drop=True)
 
     # --- 2. Create Observation Matrix and Coordinate Inputs ---
     logging.info("Pivoting data to create observation matrix...")
@@ -37,7 +40,7 @@ def run_model_with_taxi_data(csv_path: str):
     # Fill missing values with 0, assuming no record means no rides
     obs_matrix = df.pivot_table(
         index='location_id', 
-        columns='hour', 
+        columns='time_id', 
         values='ride_count'
     ).fillna(0)
     
@@ -54,6 +57,8 @@ def run_model_with_taxi_data(csv_path: str):
     logging.info("Computing distance matrices...")
     # Spatial distance matrix (Ds)
     Ds = squareform(pdist(coords, metric='euclidean'))
+    # Scale up distances to improve numerical stability, as recommended by the error message.
+    Ds = Ds * 1000.0
     # Temporal distance matrix (Dt)
     time_points = obs_matrix.columns.values.reshape(-1, 1)
     Dt = squareform(pdist(time_points, metric='euclidean'))
@@ -62,15 +67,12 @@ def run_model_with_taxi_data(csv_path: str):
     logging.info("Constructing the design matrix X...")
     # To ensure the X matrix rows align with the flattened y vector, we must
     # sort the original dataframe in the same column-major order used by `make_y_Vs_Vt`.
-    # `make_y_Vs_Vt` flattens the obs_matrix column by column (i.e., by 'hour').
-    df_sorted = df.sort_values(['hour', 'location_id'])
+    # `make_y_Vs_Vt` flattens the obs_matrix column by column (i.e., by 'time_id').
+    df_sorted = df.sort_values(['time_id', 'location_id'])
 
-    # Create an interaction term for hour and weekend
-    # This creates a unique category for each hour, separating weekday and weekend
-    df_sorted['hour_weekend_interaction'] = df_sorted['hour'].astype(str) + '_is_weekend_' + df_sorted['is_weekend'].astype(str)
-
-    # Use one-hot encoding to create the design matrix X from this interaction term
-    X_dummies = pd.get_dummies(df_sorted['hour_weekend_interaction'], drop_first=True, prefix='h')
+    # Use one-hot encoding on the time_id to create the design matrix X.
+    # This automatically handles the differentiation of weekday and weekend hours.
+    X_dummies = pd.get_dummies(df_sorted['time_id'], drop_first=True, prefix='time')
     
     # Add an intercept term
     X = X_dummies.copy()
@@ -105,9 +107,9 @@ def run_model_with_taxi_data(csv_path: str):
         Vt=Vt,
         Ds=Ds,
         Dt=Dt,
-        n_samples=2000,
-        burn_in=1000,
-        verbose=True
+        nsim=2000,
+        burn=1000,
+        print_progress=True
     )
 
     # --- 7. Process Results ---
