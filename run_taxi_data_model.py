@@ -5,10 +5,10 @@ from scipy.spatial.distance import pdist, squareform
 import logging
 
 from src.model_module.core import ZINB_GP
-from src.model_module.utils import make_y_Vs_Vt
+from src.model_module.utils import make_y_Vs_Vt, get_gp_length_scale_bound, kernel_s_combined, kernel_t_combined
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def run_model_with_taxi_data(csv_path: str):
     """
@@ -25,53 +25,50 @@ def run_model_with_taxi_data(csv_path: str):
         logging.error(f"Data file not found at {csv_path}. Please update the path.")
         return
 
-    # Create a combined time identifier (0-23 for weekday, 24-47 for weekend)
-    df['time_id'] = df['hour'] + 24 * df['is_weekend']
-
     # For consistency, sort the dataframe early
-    df = df.sort_values(by=['grid_x', 'grid_y', 'time_id']).reset_index(drop=True)
+    df = df.sort_values(by=['grid_x', 'grid_y', 'is_weekend', 'hour']).reset_index(drop=True)
 
     # --- 2. Create Observation Matrix and Coordinate Inputs ---
     logging.info("Pivoting data to create observation matrix...")
-    # Create a unique location identifier for each grid cell
-    df['location_id'] = df.groupby(['grid_x', 'grid_y']).ngroup()
     
     # Pivot to get (locations x time) matrix for ride counts
     # Fill missing values with 0, assuming no record means no rides
     obs_matrix = df.pivot_table(
-        index='location_id', 
-        columns='time_id', 
+        index=['grid_y', 'grid_x'],
+        columns=['is_weekend', 'hour'],
         values='ride_count'
     ).fillna(0)
     
     # Get the unique coordinates corresponding to the location_id index
-    coords_df = df[['location_id', 'grid_x', 'grid_y']].drop_duplicates().sort_values('location_id')
-    coords = coords_df[['grid_x', 'grid_y']].values
+    coords = np.array(obs_matrix.index.to_list())
 
     # --- 3. Generate y, Vs, and Vt using the helper function ---
     logging.info("Generating y, Vs, and Vt from observation matrix...")
     data_struct = make_y_Vs_Vt(obs_matrix.values)
     y, Vs, Vt = data_struct['y'], data_struct['Vs'], data_struct['Vt']
 
-    # --- 4. Compute Spatial and Temporal Distance Matrices ---
-    logging.info("Computing distance matrices...")
-    # Spatial distance matrix (Ds)
-    Ds = squareform(pdist(coords, metric='euclidean'))
-    # Scale up distances to improve numerical stability, as recommended by the error message.
-    Ds = Ds * 1000.0
-    # Temporal distance matrix (Dt)
-    time_points = obs_matrix.columns.values.reshape(-1, 1)
-    Dt = squareform(pdist(time_points, metric='euclidean'))
+    # --- 4. Create Spatial and Temporal Feature Matrices & Get Priors ---
+    logging.info("Defining feature matrices and calculating GP prior bounds...")
+    # Spatial feature matrix is just the coordinates
+    Ds_features = coords
+    
+    # Temporal feature matrix from the MultiIndex columns.
+    # This results in an array where columns are [is_weekend, hour].
+    Dt_features = np.array(obs_matrix.columns.to_list())
+    
+    ls_s_max = get_gp_length_scale_bound(Ds_features, 'Ds')
+    ls_t_max = get_gp_length_scale_bound(Dt_features, 'Dt')
 
     # --- 5. Construct the Design Matrix (X) ---
     logging.info("Constructing the design matrix X...")
     # To ensure the X matrix rows align with the flattened y vector, we must
     # sort the original dataframe in the same column-major order used by `make_y_Vs_Vt`.
-    # `make_y_Vs_Vt` flattens the obs_matrix column by column (i.e., by 'time_id').
-    df_sorted = df.sort_values(['time_id', 'location_id'])
+    # `make_y_Vs_Vt` flattens by columns, which are (is_weekend, hour).
+    df_sorted = df.sort_values(['is_weekend', 'hour', 'grid_y', 'grid_x'])
 
     # Use one-hot encoding on the time_id to create the design matrix X.
     # This automatically handles the differentiation of weekday and weekend hours.
+    df_sorted['time_id'] = df_sorted['hour'] + 24 * df_sorted['is_weekend']
     X_dummies = pd.get_dummies(df_sorted['time_id'], drop_first=True, prefix='time')
     
     # Add an intercept term
@@ -82,6 +79,9 @@ def run_model_with_taxi_data(csv_path: str):
     cols = ['intercept'] + [col for col in X.columns if col != 'intercept']
     X = X[cols]
 
+    # Explicitly convert to a numeric dtype to avoid 'object' type arrays
+    X = X.astype(np.float64)
+
     # --- 6. Verify Shapes and Run the Model ---
     logging.info("Verification of matrix shapes:")
     logging.info(f"  Observation Matrix (locations x time): {obs_matrix.shape}")
@@ -90,8 +90,8 @@ def run_model_with_taxi_data(csv_path: str):
     logging.info(f"  X (obs x features): {X.shape}")
     logging.info(f"  Vs (obs x locations): {Vs.shape}")
     logging.info(f"  Vt (obs x time): {Vt.shape}")
-    logging.info(f"  Ds (locations x locations): {Ds.shape}")
-    logging.info(f"  Dt (time x time): {Dt.shape}")
+    logging.info(f"  Ds_features (locations x 2): {Ds_features.shape}")
+    logging.info(f"  Dt_features (time x 2): {Dt_features.shape}")
 
     if y.shape[0] != X.shape[0]:
         logging.error("Shape mismatch between y and X. Aborting model run.")
@@ -99,14 +99,22 @@ def run_model_with_taxi_data(csv_path: str):
 
     logging.info("Starting ZINB-GP model run...")
     # These are example hyperparameters. You should tune them for your needs.
+    # We pass the feature matrices to the model now.
     model_results = ZINB_GP(
         X=X.values, 
         y=y,
         coords=coords,
         Vs=Vs,
         Vt=Vt,
-        Ds=Ds,
-        Dt=Dt,
+        Ds_features=Ds_features,
+        Dt_features=Dt_features,
+        priors={
+            'ltPrior': {'max': ls_t_max},
+            'lsPrior': {'max': ls_s_max}
+        },
+        # The ZINB_GP model will be adapted to not need these pre-computed matrices
+        Ds=None, # No longer needed
+        Dt=None, # No longer needed
         nsim=2000,
         burn=1000,
         print_progress=True

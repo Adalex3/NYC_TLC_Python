@@ -1,7 +1,8 @@
 import numpy as np
 from scipy.sparse import coo_matrix
-from scipy.linalg import solve
+from scipy.spatial.distance import cdist
 from scipy.sparse.linalg import eigsh
+from sklearn.utils.extmath import randomized_svd
 import logging
 
 # ==============================================================================
@@ -47,69 +48,67 @@ def make_y_Vs_Vt(obs_matrix):
 
     return {'Vs': Vs, 'Vt': Vt, 'y': y}
 
-def gp_param_bounds(Ds, Dt, kernel_func, cond_limit=1e3):
+def kernel_s_combined(X, ls):
     """
-    Finds reasonable upper bounds on GP length scale parameters by ensuring the
-    kernel matrices remain well-conditioned.
+    Combined ARD (Automatic Relevance Determination) kernel for spatial features.
+    This is an RBF kernel where each feature has its own length scale.
     
-    :param Ds: Spatial distance matrix
-    :param Dt: Temporal distance matrix
-    :param kernel_func: kernel function
-    :param cond_limit: The maximum allowable condition number for the kernel matrices.
-    :return: A dictionary with maximum values for the length scales: {'lsmax', 'ltmax'}
+    Assumes X is a (n_samples, n_features) array.
+    'ls' is a tuple of length scales, one for each feature.
     """
-    print("I am here 2")
-    logger = logging.getLogger(__name__)
-    print("I am here 3")
-
-    logger.debug("Computing GP length scale bounds...")
-    print("I am here 4")
-
-    def find_max_ls(D, name):
-        """Helper to find max length scale for a given distance matrix."""
-        ls_inv = 1.0 # This is 1/ls
-        print(f"Finding max length scale for {name}...")
-        # Iteratively increase 1/ls (decrease ls) until matrix is ill-conditioned
-        while True:
-            print(f"Testing {name} with 1/ls={ls_inv:.4f}...")
-            K = kernel_func(D, 1.0 / ls_inv)
-            
-            # PERFORMANCE BOTTLENECK: np.linalg.cond(K) is very slow for large K.
-            # SOLUTION: Estimate condition number from extreme eigenvalues.
-            # For a symmetric positive semi-definite matrix, cond(K) = lambda_max / lambda_min.
-            # We can find these extreme eigenvalues efficiently without a full SVD.
-            try:
-                print("Estimating condition number via extreme eigenvalues...")
-                # Find the largest and smallest (by magnitude) eigenvalues.
-                # 'LM' for largest magnitude, 'SM' for smallest magnitude.
-                # k=1 means we want one of each. which='BE' for both ends is also an option.
-                lambda_max = eigsh(K, k=1, which='LM', return_eigenvectors=False)[0]
-                lambda_min = eigsh(K, k=1, which='SM', return_eigenvectors=False)[0]
-                cond_num = np.abs(lambda_max / lambda_min) if lambda_min != 0 else np.inf
-            except Exception as e:
-                logger.warning(f"Eigenvalue estimation failed for {name} with 1/ls={ls_inv:.4f}: {e}")
-                cond_num = np.inf
-
-            print(f"Estimated condition number for {name} with 1/ls={ls_inv:.4f}: {cond_num:.2f}")
-            if np.isinf(cond_num) or cond_num > cond_limit:
-                break
-            ls_inv *= 2.0
-        
-        ls_max = 1.0 / (ls_inv / 2.0)
-        print(f"Determined max length scale for {name} ({name}max): {ls_max:.4f}")
-        return ls_max
-
-    print("I am here 5")
-    lsmax = find_max_ls(Ds, "ls")
-    print("I am here 6")
-    if lsmax < 1.0:
-        raise ValueError("Ds causes ill-conditioned kernel matrix, try increasing distances between spatial coordinates, e.g. Ds <- 100 * Ds")
+    # Ensure ls is a numpy array for vectorized operations
+    ls = np.asarray(ls)
     
-    ltmax = find_max_ls(Dt, "lt")
-    if ltmax < 1.0:
-        raise ValueError("Dt casuses ill-conditioned kernel matrix, try increasing distances between temporal coordinates, e.g. Dt <- Dt * 100")
+    # Scale each feature by its length scale before computing distance
+    # X_scaled has shape (n_samples, n_features)
+    X_scaled = X / ls
     
-    return {'ltmax': ltmax, 'lsmax': lsmax}
+    # Compute the squared Euclidean distance on the scaled features
+    D2_scaled = cdist(X_scaled, X_scaled, 'sqeuclidean')
+    return np.exp(-0.5 * D2_scaled)
+
+def kernel_t_combined(X, ls):
+    """
+    Combined kernel for temporal features (is_weekend, hour).
+    Assumes X is a 2D array where:
+    - Column 0 is 'is_weekend' (categorical).
+    - Column 1 is the 'hour' (continuous).
+    'ls' is a tuple of length scales (ls_weekend, ls_hour).
+    """
+    ls_weekend, ls_hour = ls
+
+    # RBF kernel for the 'is_weekend' feature (acts like a categorical check)
+    weekends = X[:, 0].reshape(-1, 1)
+    D2_weekend = cdist(weekends, weekends, 'sqeuclidean')
+    K_weekend = np.exp(-0.5 * D2_weekend / ls_weekend**2)
+
+    # RBF kernel for the 'hour' feature
+    hours = X[:, 1].reshape(-1, 1)
+    D2_hour = cdist(hours, hours, 'sqeuclidean')
+    K_hour = np.exp(-0.5 * D2_hour / ls_hour**2)
+
+    # Combine kernels by element-wise multiplication
+    return K_hour * K_weekend
+
+def get_gp_length_scale_bound(features, name):
+    """
+    Calculates a reasonable upper bound for a GP length scale parameter.
+
+    This is a simple heuristic: a good upper bound is on the order of the
+    maximum possible distance between any two points in the feature space.
+    This prevents the kernel from becoming ill-conditioned by choosing a length
+    scale so large that all points appear identical.
+
+    Args:
+        features (np.ndarray): The input feature matrix (n_samples, n_features).
+        name (str): A name for logging purposes (e.g., 'Ds', 'Dt').
+
+    Returns:
+        float: A reasonable upper bound for the length scale.
+    """
+    max_dist = np.sqrt(cdist(features, features, 'sqeuclidean').max())
+    logging.info(f"Determined max length scale for {name} based on max feature distance: {max_dist:.4f}")
+    return max_dist
 
 # ==============================================================================
 # From svd.R

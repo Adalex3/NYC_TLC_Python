@@ -1,6 +1,7 @@
 import numpy as np
 import statsmodels.api as sm
 from statsmodels.genmod.families import Binomial
+from sklearn.utils.extmath import randomized_svd
 from statsmodels.discrete.discrete_model import NegativeBinomial
 from scipy.stats import gamma, beta, multivariate_normal, invgamma, uniform, truncnorm, nbinom, norm
 from scipy.linalg import block_diag
@@ -9,8 +10,8 @@ import logging
 
 # Import helper functions from our utils module
 from src.model_module.utils import (
-    noise_mix, kernel, nullcheck, sigmoid, 
-    solve_svd, mvn_sample_svd, gp_param_bounds
+    noise_mix, nullcheck, sigmoid, solve_svd, mvn_sample_svd,
+    kernel_s_combined, kernel_t_combined
 )
 
 # ==============================================================================
@@ -79,7 +80,7 @@ def rpg(n, h, z):
 # From ZINB_GP.R
 # ==============================================================================
 
-def update_ls_sigma_noise(ls, sigma, noise_ratio, gpdraw, K, D, lsPrior, sigmaPrior, noisePrior, kern, param_name="param"):
+def update_ls_sigma_noise(ls, sigma, noise_ratio, gpdraw, K, features, lsPrior, sigmaPrior, noisePrior, kernel_func, param_name="param"):
     """
     Update kernel parameters for a GP
     
@@ -88,7 +89,7 @@ def update_ls_sigma_noise(ls, sigma, noise_ratio, gpdraw, K, D, lsPrior, sigmaPr
     :param noise_ratio: Current noise ratio
     :param gpdraw: Last draw from the gp with these parameters
     :param K: Current kernel matrix
-    :param D: Distance matrix
+    :param features: Feature matrix for the kernel
     :param lsPrior: prior information for length scale, needs mh_sd, max, a, b
     :param sigmaPrior: prior information for sigma, needs a, b
     :param noisePrior: prior information for noise_ratio, needs mh_sd, a, b
@@ -103,23 +104,31 @@ def update_ls_sigma_noise(ls, sigma, noise_ratio, gpdraw, K, D, lsPrior, sigmaPr
     logger = logging.getLogger(__name__)
 
     # update ls
-    logger.debug(f"Updating ls for {param_name}. Current ls: {ls:.4f}")
-    proposal = rtnorm(1, mean=ls, sd=lsPrior['mh_sd'], lower=1e-6, upper=lsPrior['max'])[0]
-    logger.debug(f"  - ls proposal: {proposal:.4f}")
+    # Handle single or multiple length scales (for ARD kernels)
+    is_ard = isinstance(ls, (list, tuple, np.ndarray))
+    if is_ard:
+        ls_array = np.array(ls)
+        proposal_array = rtnorm(len(ls_array), mean=ls_array, sd=lsPrior['mh_sd'], lower=1e-6, upper=lsPrior['max'])
+        proposal = tuple(proposal_array)
+    else:
+        proposal = rtnorm(1, mean=ls, sd=lsPrior['mh_sd'], lower=1e-6, upper=lsPrior['max'])[0]
+    
+    logger.debug(f"Updating ls for {param_name}. Current ls: {ls}")
+    logger.debug(f"  - ls proposal: {proposal}")
     
     accepted_ls = False
-    K_star = sigma**2 * noise_mix(kern(D, proposal), noise_ratio)
+    K_star = sigma**2 * noise_mix(kernel_func(features, proposal), noise_ratio)
     
     zero_mean = np.zeros(len(gpdraw))
     try:
         likelihood_ls = dmvnorm(gpdraw, mean=zero_mean, sigma=K_star, log=True) - \
                         dmvnorm(gpdraw, mean=zero_mean, sigma=K, log=True)
         
-        prior_ls = dgamma(proposal, shape=lsPrior['a'], rate=lsPrior['b'], log=True) - \
-                   dgamma(ls, shape=lsPrior['a'], rate=lsPrior['b'], log=True)
+        prior_ls = np.sum(dgamma(proposal, shape=lsPrior['a'], rate=lsPrior['b'], log=True)) - \
+                   np.sum(dgamma(ls, shape=lsPrior['a'], rate=lsPrior['b'], log=True))
         
-        trans_ls = dtnorm(ls, mean=proposal, sd=lsPrior['mh_sd'], lower=1e-6, upper=lsPrior['max'], log=True) - \
-                   dtnorm(proposal, mean=ls, sd=lsPrior['mh_sd'], lower=1e-6, upper=lsPrior['max'], log=True)
+        trans_ls = np.sum(dtnorm(ls, mean=proposal, sd=lsPrior['mh_sd'], lower=1e-6, upper=lsPrior['max'], log=True)) - \
+                   np.sum(dtnorm(proposal, mean=ls, sd=lsPrior['mh_sd'], lower=1e-6, upper=lsPrior['max'], log=True))
 
         posterior_ls = likelihood_ls + prior_ls + trans_ls
 
@@ -139,7 +148,7 @@ def update_ls_sigma_noise(ls, sigma, noise_ratio, gpdraw, K, D, lsPrior, sigmaPr
     logger.debug(f"  - noise_ratio proposal: {proposal:.4f}")
 
     accepted_nr = False
-    K_star = sigma**2 * noise_mix(kern(D, ls), proposal)
+    K_star = sigma**2 * noise_mix(kernel_func(features, ls), proposal)
     
     try:
         likelihood_nr = dmvnorm(gpdraw, mean=np.zeros(len(gpdraw)), sigma=K_star, log=True) - \
@@ -163,7 +172,7 @@ def update_ls_sigma_noise(ls, sigma, noise_ratio, gpdraw, K, D, lsPrior, sigmaPr
 
     # update sigma
     logger.debug(f"Updating sigma for {param_name}. Current sigma: {sigma:.4f}")
-    K_nosigma = noise_mix(kern(D, ls**2), noise_ratio)
+    K_nosigma = noise_mix(kernel_func(features, ls), noise_ratio)
     
     try:
         K_nosigma_inv = np.linalg.solve(K_nosigma, np.eye(K_nosigma.shape[0]))
@@ -186,9 +195,9 @@ def update_ls_sigma_noise(ls, sigma, noise_ratio, gpdraw, K, D, lsPrior, sigmaPr
     return {'ls': ls, 'sigma': sigma, 'noise_ratio': noise_ratio, 'K': K, 'K_inv': K_inv}
 
 
-def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False, 
+def ZINB_GP(X, y, coords, Vs, Vt, Ds_features, Dt_features, priors, nsim, burn, thin=1, save_ypred=False, 
             print_iter=100, print_progress=False, ltPrior=None, lsPrior=None, 
-            sigmaPrior=None, noisePrior=None, mh_sd_r=None, kern=None):
+            sigmaPrior=None, noisePrior=None, mh_sd_r=None, **kwargs):
     """
     Run the ZINB NNGP model.
     Includes numerical stability fixes and strict type casting for Python.
@@ -198,29 +207,22 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False,
     # X is the design matrix with dimension N*p
     # x is the vector with length N
     # y is the count response with length N
-    n = coords.shape[0] - 1 # number of clusters
+    n_locs = Ds_features.shape[0]
+    n_times = Dt_features.shape[0]
+    n = n_locs - 1 # number of spatial random effects
     N = X.shape[0] # number of observations
     p = X.shape[1] # dimension of alpha and beta
-    n_time_points = Vt.shape[1]
-    logger.info(f"Initializing ZINB-GP model with N={N}, p={p}, n_locs={n+1}, n_time={n_time_points+1}")
+    n_time_points = n_times - 1 # number of temporal random effects
+    logger.info(f"Initializing ZINB-GP model with N={N}, p={p}, n_locs={n_locs}, n_time={n_times}")
 
-    # Sacrifice to the intercept gods
-    Ds = Ds[1:, 1:]
-    Dt = Dt[1:, 1:]
+    print("here1")
 
-    # Use squared distances
-    Ds = Ds * Ds
-    Dt = Dt * Dt
-
-    # Find reasonable bounds for GP length scales
-    kern = nullcheck(kern, kernel)
-    print("I am here")
-    param_bounds = gp_param_bounds(Ds, Dt, kern)
-    print("HERERERERER!!!")
-    lsmax = param_bounds['lsmax']
-    ltmax = param_bounds['ltmax']
-    print("HERERERERER!!!")
-    logger.debug(f"GP length scale bounds computed: lsmax={lsmax:.4f}, ltmax={ltmax:.4f}")
+    # Get prior bounds from the input dictionary
+    lsmax = priors.get('lsPrior', {}).get('max', 10.0)
+    print("here2")
+    ltmax = priors.get('ltPrior', {}).get('max', 10.0)
+    print("here3")
+    logger.debug(f"Using GP length scale bounds from priors: lsmax={lsmax:.4f}, ltmax={ltmax:.4f}")
 
     ##########
     # Priors #
@@ -230,10 +232,12 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False,
     T0a = np.eye(p) * 100
     T0b = np.eye(p) * 100
     sd_r = nullcheck(mh_sd_r, 0.4)
+
+    print("here4")
     
     ####### kernel hyperparameters  ######
-    ltPrior = nullcheck(ltPrior, {'max': ltmax, 'mh_sd': 3, 'a': 1, 'b': 0.001})
-    lsPrior = nullcheck(lsPrior, {'max': lsmax, 'mh_sd': 3, 'a': 1, 'b': 0.001})
+    ltPrior = nullcheck(ltPrior, {'max': ltmax, 'mh_sd': 0.5, 'a': 1, 'b': 0.001})
+    lsPrior = nullcheck(lsPrior, {'max': lsmax, 'mh_sd': 0.5, 'a': 1, 'b': 0.001})
     sigmaPrior = nullcheck(sigmaPrior, {'a': 0.01, 'b': 0.1})
     noisePrior = nullcheck(noisePrior, {'a': 1.5, 'b': 1.5, 'mh_sd': 0.2})
     logger.debug("Priors have been set.")
@@ -287,36 +291,61 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False,
     ##########################
     # Spatial Random Effects #
     ##########################
-    l1s = l2s = 1.0
+    # Initialize length scales as tuples for ARD kernels
+    l1s = (1.0, 1.0)
+    l2s = (1.0, 1.0)
     sigma1s = sigma2s = 2.0
-    Ks_bin = sigma1s**2 * noise_mix(kern(Ds, l1s), noise_ratio_s1)
+    # We only need kernels for the n random effects (n x n matrix)
+    Ds_features_re = Ds_features[1:, :]
+    Ks_bin = sigma1s**2 * noise_mix(kernel_s_combined(Ds_features_re, l1s), noise_ratio_s1)
     Ks_bin_inv = np.linalg.solve(Ks_bin, np.eye(Ks_bin.shape[0])) 
     Ks_bin_inv = (Ks_bin_inv + Ks_bin_inv.T) / 2
 
-    Ks_nb = sigma2s**2 * noise_mix(kern(Ds, l2s), noise_ratio_s2)
-    Ks_nb_inv = np.linalg.solve(Ks_nb, np.eye(Ks_nb.shape[0]))
-    Ks_nb_inv = (Ks_nb_inv + Ks_nb_inv.T) / 2
+    print("helloooo")
 
-    a = multivariate_normal.rvs(cov=Ks_bin)
-    c = multivariate_normal.rvs(cov=Ks_nb)
-    logger.debug(f"Initialized spatial random effects 'a' (shape: {a.shape}) and 'c' (shape: {c.shape})")
+    Ks_nb = sigma2s**2 * noise_mix(kernel_s_combined(Ds_features_re, l2s), noise_ratio_s2)
+    print("helloooo2")
+    Ks_nb_inv = np.linalg.solve(Ks_nb, np.eye(Ks_nb.shape[0])) # time sink (~15sec)
+    print("helloooo3")
+    Ks_nb_inv = (Ks_nb_inv + Ks_nb_inv.T) / 2
+    print("helloooo4")
+
+    # --- Optimized Multivariate Normal Sampling ---
+    # The original `multivariate_normal.rvs(cov=K)` is slow and memory-heavy for large
+    # covariance matrices because it may perform a costly decomposition internally.
+    # A much faster method is to compute the Cholesky decomposition of the covariance
+    # matrix (K = L @ L.T) and then generate the sample as `a = L @ z`, where `z` is a
+    # vector of standard normal random variables.
+
+    # 1. Perform Cholesky decomposition on the covariance matrices.
+    L_bin = np.linalg.cholesky(Ks_bin)
+    L_nb = np.linalg.cholesky(Ks_nb)
+
+    # 2. Generate samples using the Cholesky factors.
+    a = L_bin @ np.random.normal(size=n)
+    print("helloooo5")
+    c = L_nb @ np.random.normal(size=n)
+    print("helloooo6")
+    logger.debug(f"Initialized spatial random effects 'a' (shape: {a.shape}) and 'c' (shape: {c.shape}) for {n} locations")
 
     #################
     # Temporal Random Effects #
     #################
     sigma1t = sigma2t = 2.0
-    l1t = l2t = 1.0
-    Kt_bin = sigma1t**2 * noise_mix(kern(Dt, l1t), noise_ratio_t1)
+    l1t = (1.0, 1.0)
+    l2t = (1.0, 1.0)
+    Dt_features_re = Dt_features[1:, :]
+    Kt_bin = sigma1t**2 * noise_mix(kernel_t_combined(Dt_features_re, l1t), noise_ratio_t1)
     Kt_bin_inv = np.linalg.solve(Kt_bin, np.eye(Kt_bin.shape[0]))
     Kt_bin_inv = (Kt_bin_inv + Kt_bin_inv.T) / 2
 
-    Kt_nb = sigma2t**2 * noise_mix(kern(Dt, l2t), noise_ratio_t2)
+    Kt_nb = sigma2t**2 * noise_mix(kernel_t_combined(Dt_features_re, l2t), noise_ratio_t2)
     Kt_nb_inv = np.linalg.solve(Kt_nb, np.eye(Kt_nb.shape[0]))
     Kt_nb_inv = (Kt_nb_inv + Kt_nb_inv.T) / 2
     
     b = multivariate_normal.rvs(cov=Kt_bin)
     d = multivariate_normal.rvs(cov=Kt_nb)
-    logger.debug(f"Initialized temporal random effects 'b' (shape: {b.shape}) and 'd' (shape: {d.shape})")
+    logger.debug(f"Initialized temporal random effects 'b' (shape: {b.shape}) and 'd' (shape: {d.shape}) for {n_time_points} time points")
 
     ############
     # Num Sims #
@@ -333,17 +362,17 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False,
     C = np.zeros((lastit, n))
     B = np.zeros((lastit, n_time_points))
     D_store = np.zeros((lastit, n_time_points)) 
-
-    L1t = np.zeros(lastit)
+    
+    L1t = np.zeros((lastit, 2))
     Sigma1t = np.zeros(lastit)
     Noise1t = np.zeros(lastit)
-    L2t = np.zeros(lastit)
+    L2t = np.zeros((lastit, 2))
     Sigma2t = np.zeros(lastit)
     Noise2t = np.zeros(lastit)
-    L1s = np.zeros(lastit)
+    L1s = np.zeros((lastit, 2))
     Sigma1s = np.zeros(lastit)
     Noise1s = np.zeros(lastit)
-    L2s = np.zeros(lastit)
+    L2s = np.zeros((lastit, 2))
     Sigma2s = np.zeros(lastit)
     Noise2s = np.zeros(lastit)
     
@@ -393,7 +422,16 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False,
         
         sqrt_w_XV = np.sqrt(w)[:, None] * XV
         crossprod_val = sqrt_w_XV.T @ sqrt_w_XV
-        svd_vinv_u, svd_vinv_s, svd_vinv_v = np.linalg.svd(crossprod_val + T0_bin)
+
+        # --- Optimized SVD Calculation ---
+        # The full SVD (np.linalg.svd) is computationally expensive. For large matrices
+        # inside an MCMC loop, this becomes a major bottleneck.
+        # We can use a randomized SVD, which computes an approximate low-rank decomposition
+        # much more quickly. This is highly effective as the precision matrices often have
+        # a fast-decaying singular value spectrum.
+        # The number of components is a tunable parameter; a value around 150 is often a
+        # good starting point for matrices of this size (~200x200) to balance speed and accuracy.
+        svd_vinv_u, svd_vinv_s, svd_vinv_v = randomized_svd(crossprod_val + T0_bin, n_components=150, random_state=None)
         svd_vinv = {'u': svd_vinv_u, 'd': svd_vinv_s, 'v': svd_vinv_v.T}
 
         # Stable calculation for RHS: XV.T @ (y1 - 0.5)
@@ -451,15 +489,15 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False,
         # Update Hyperparams (Logistic)
         # -----------------------------------------------------
         logger.debug(f"Iter {i}: Updating logistic component hyperparameters.")
-        out = update_ls_sigma_noise(l1t, sigma1t, noise_ratio_t1, b, Kt_bin, Dt, ltPrior, sigmaPrior, noisePrior, kern)
+        out = update_ls_sigma_noise(l1t, sigma1t, noise_ratio_t1, b, Kt_bin, Dt_features_re, ltPrior, sigmaPrior, noisePrior, kernel_t_combined, "Logistic Temporal")
         l1t, sigma1t, noise_ratio_t1 = out['ls'], out['sigma'], out['noise_ratio']
         Kt_bin, Kt_bin_inv = out['K'], out['K_inv']
-        logger.debug(f"Iter {i}: Logistic Temporal - l1t={l1t:.4f}, sigma1t={sigma1t:.4f}, noise1t={noise_ratio_t1:.4f}")
+        logger.debug(f"Iter {i}: Logistic Temporal - l1t={l1t}, sigma1t={sigma1t:.4f}, noise1t={noise_ratio_t1:.4f}")
 
-        out = update_ls_sigma_noise(l1s, sigma1s, noise_ratio_s1, a, Ks_bin, Ds, lsPrior, sigmaPrior, noisePrior, kern)
+        out = update_ls_sigma_noise(l1s, sigma1s, noise_ratio_s1, a, Ks_bin, Ds_features_re, lsPrior, sigmaPrior, noisePrior, kernel_s_combined, "Logistic Spatial")
         l1s, sigma1s, noise_ratio_s1 = out['ls'], out['sigma'], out['noise_ratio']
         Ks_bin, Ks_bin_inv = out['K'], out['K_inv']
-        logger.debug(f"Iter {i}: Logistic Spatial - l1s={l1s:.4f}, sigma1s={sigma1s:.4f}, noise1s={noise_ratio_s1:.4f}")
+        logger.debug(f"Iter {i}: Logistic Spatial - l1s={l1s}, sigma1s={sigma1s:.4f}, noise1s={noise_ratio_s1:.4f}")
         if print_progress: inner_bar.update(1)
 
         # -----------------------------------------------------
@@ -475,7 +513,12 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False,
 
         sqrt_w_XV_sub = np.sqrt(w)[:, None] * XV[mask_y1]
         crossprod_val = sqrt_w_XV_sub.T @ sqrt_w_XV_sub
-        svd_vinv_u, svd_vinv_s, svd_vinv_v = np.linalg.svd(crossprod_val + T0_nb)
+
+        # --- Optimized SVD Calculation ---
+        # As with the logistic component, we use randomized SVD here to accelerate the
+        # decomposition of the precision matrix for the count component parameters.
+        # This provides a significant performance boost within the MCMC loop.
+        svd_vinv_u, svd_vinv_s, svd_vinv_v = randomized_svd(crossprod_val + T0_nb, n_components=150, random_state=None)
         svd_vinv = {'u': svd_vinv_u, 'd': svd_vinv_s, 'v': svd_vinv_v.T}
 
         # Stable calculation for RHS
@@ -493,15 +536,15 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False,
         # Update Hyperparams (Count)
         # -----------------------------------------------------
         logger.debug(f"Iter {i}: Updating count component hyperparameters.")
-        out = update_ls_sigma_noise(l2t, sigma2t, noise_ratio_t2, d, Kt_nb, Dt, ltPrior, sigmaPrior, noisePrior, kern)
+        out = update_ls_sigma_noise(l2t, sigma2t, noise_ratio_t2, d, Kt_nb, Dt_features_re, ltPrior, sigmaPrior, noisePrior, kernel_t_combined, "Count Temporal")
         l2t, sigma2t, noise_ratio_t2 = out['ls'], out['sigma'], out['noise_ratio']
         Kt_nb, Kt_nb_inv = out['K'], out['K_inv']
-        logger.debug(f"Iter {i}: Count Temporal - l2t={l2t:.4f}, sigma2t={sigma2t:.4f}, noise2t={noise_ratio_t2:.4f}")
+        logger.debug(f"Iter {i}: Count Temporal - l2t={l2t}, sigma2t={sigma2t:.4f}, noise2t={noise_ratio_t2:.4f}")
 
-        out = update_ls_sigma_noise(l2s, sigma2s, noise_ratio_s2, c, Ks_nb, Ds, lsPrior, sigmaPrior, noisePrior, kern)
+        out = update_ls_sigma_noise(l2s, sigma2s, noise_ratio_s2, c, Ks_nb, Ds_features_re, lsPrior, sigmaPrior, noisePrior, kernel_s_combined, "Count Spatial")
         l2s, sigma2s, noise_ratio_s2 = out['ls'], out['sigma'], out['noise_ratio']
         Ks_nb, Ks_nb_inv = out['K'], out['K_inv']
-        logger.debug(f"Iter {i}: Count Spatial - l2s={l2s:.4f}, sigma2s={sigma2s:.4f}, noise2s={noise_ratio_s2:.4f}")
+        logger.debug(f"Iter {i}: Count Spatial - l2s={l2s}, sigma2s={sigma2s:.4f}, noise2s={noise_ratio_s2:.4f}")
         if print_progress: inner_bar.update(1)
 
         # -----------------------------------------------------
@@ -518,19 +561,19 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds, Dt, nsim, burn, thin=1, save_ypred=False,
             C[j, :] = c
             D_store[j, :] = d # random effects
             
-            L1t[j] = l1t
+            L1t[j, :] = l1t
             Noise1t[j] = noise_ratio_t1
             Sigma1t[j] = sigma1t # temporal hyperparameters
             
-            L2t[j] = l2t
+            L2t[j, :] = l2t
             Noise2t[j] = noise_ratio_t2
             Sigma2t[j] = sigma2t # temporal hyperparameters
             
-            L1s[j] = l1s
+            L1s[j, :] = l1s
             Noise1s[j] = noise_ratio_s1
             Sigma1s[j] = sigma1s # spatial hyperparameters
             
-            L2s[j] = l2s
+            L2s[j, :] = l2s
             Noise2s[j] = noise_ratio_s2
             Sigma2s[j] = sigma2s # spatial hyperparameters
             
