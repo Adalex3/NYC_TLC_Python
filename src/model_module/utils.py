@@ -1,6 +1,8 @@
 import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.linalg import solve
+from scipy.sparse.linalg import eigsh
+import logging
 
 # ==============================================================================
 # From setup.R
@@ -45,47 +47,68 @@ def make_y_Vs_Vt(obs_matrix):
 
     return {'Vs': Vs, 'Vt': Vt, 'y': y}
 
-def gp_param_bounds(Ds, Dt, kernel_func, tolerance=1e-10):
+def gp_param_bounds(Ds, Dt, kernel_func, cond_limit=1e3):
     """
-    Finds reasonable upper/lower bounds on gp parameters ensuring matrices remain pd invertible
+    Finds reasonable upper bounds on GP length scale parameters by ensuring the
+    kernel matrices remain well-conditioned.
     
     :param Ds: Spatial distance matrix
     :param Dt: Temporal distance matrix
     :param kernel_func: kernel function
-    :return: Minimum values for l*s, maximum values for l*t 
+    :param cond_limit: The maximum allowable condition number for the kernel matrices.
+    :return: A dictionary with maximum values for the length scales: {'lsmax', 'ltmax'}
     """
-    smin = 1.0
-    Ks = kernel_func(Ds, 1.0 / smin)
-    # TODO: Add try catch to solve for better error messages
-    # err <- sqrt(sum(((solve(Ks) %*% Ks) - diag(1, nrow=nrow(Ks)))^2))
-    err = np.sqrt(np.sum((solve(Ks, Ks) - np.eye(Ks.shape[0]))**2))
-    
-    while err < tolerance:
-        smin = smin / 2.0
-        Ks = kernel_func(Ds, 1.0 / smin)
-        err = np.sqrt(np.sum((solve(Ks, Ks) - np.eye(Ks.shape[0]))**2))
-    
-    smin = smin * 2.0
-    if smin > 0.01:
-        # stop("Ds causes ill-conditioned kernel matrix, try increasing distances between spatial coordinates, e.g. Ds <- 100 * Ds")
+    print("I am here 2")
+    logger = logging.getLogger(__name__)
+    print("I am here 3")
+
+    logger.debug("Computing GP length scale bounds...")
+    print("I am here 4")
+
+    def find_max_ls(D, name):
+        """Helper to find max length scale for a given distance matrix."""
+        ls_inv = 1.0 # This is 1/ls
+        print(f"Finding max length scale for {name}...")
+        # Iteratively increase 1/ls (decrease ls) until matrix is ill-conditioned
+        while True:
+            print(f"Testing {name} with 1/ls={ls_inv:.4f}...")
+            K = kernel_func(D, 1.0 / ls_inv)
+            
+            # PERFORMANCE BOTTLENECK: np.linalg.cond(K) is very slow for large K.
+            # SOLUTION: Estimate condition number from extreme eigenvalues.
+            # For a symmetric positive semi-definite matrix, cond(K) = lambda_max / lambda_min.
+            # We can find these extreme eigenvalues efficiently without a full SVD.
+            try:
+                print("Estimating condition number via extreme eigenvalues...")
+                # Find the largest and smallest (by magnitude) eigenvalues.
+                # 'LM' for largest magnitude, 'SM' for smallest magnitude.
+                # k=1 means we want one of each. which='BE' for both ends is also an option.
+                lambda_max = eigsh(K, k=1, which='LM', return_eigenvectors=False)[0]
+                lambda_min = eigsh(K, k=1, which='SM', return_eigenvectors=False)[0]
+                cond_num = np.abs(lambda_max / lambda_min) if lambda_min != 0 else np.inf
+            except Exception as e:
+                logger.warning(f"Eigenvalue estimation failed for {name} with 1/ls={ls_inv:.4f}: {e}")
+                cond_num = np.inf
+
+            print(f"Estimated condition number for {name} with 1/ls={ls_inv:.4f}: {cond_num:.2f}")
+            if np.isinf(cond_num) or cond_num > cond_limit:
+                break
+            ls_inv *= 2.0
+        
+        ls_max = 1.0 / (ls_inv / 2.0)
+        print(f"Determined max length scale for {name} ({name}max): {ls_max:.4f}")
+        return ls_max
+
+    print("I am here 5")
+    lsmax = find_max_ls(Ds, "ls")
+    print("I am here 6")
+    if lsmax < 1.0:
         raise ValueError("Ds causes ill-conditioned kernel matrix, try increasing distances between spatial coordinates, e.g. Ds <- 100 * Ds")
     
-    tmin = 1.0
-    Kt = kernel_func(Dt, 1.0 / tmin)
-    err = np.sqrt(np.sum((solve(Kt, Kt) - np.eye(Kt.shape[0]))**2))
-    
-    while err < tolerance:
-        tmin = tmin / 2.0
-        Kt = kernel_func(Dt, 1.0 / tmin)
-        err = np.sqrt(np.sum((solve(Kt, Kt) - np.eye(Kt.shape[0]))**2))
-    
-    tmin = tmin * 2.0
-    if tmin > 0.01:
-        # stop("Dt casuses ill-conditioned kernel matrix, try increasing distances between temporal coordinates, e.g. Dt <- Dt * 100")
+    ltmax = find_max_ls(Dt, "lt")
+    if ltmax < 1.0:
         raise ValueError("Dt casuses ill-conditioned kernel matrix, try increasing distances between temporal coordinates, e.g. Dt <- Dt * 100")
     
-    ltmax = (1.0 / tmin)
-    lsmax = (1.0 / smin)
     return {'ltmax': ltmax, 'lsmax': lsmax}
 
 # ==============================================================================
@@ -166,13 +189,13 @@ def noise_mix(A, noise_ratio):
 
 def kernel(dist, ls):
     """
-    Create the squared exponential kernel matrix e^(-dist / (ls^2))
+    Create the squared exponential kernel matrix e^(-dist / ls).
+    Assumes dist is already squared.
     
     :param dist: Distance matrix
     :param ls: length scale
     """
-    # return(exp(-dist / (ls^2)))
-    return np.exp(-dist / (ls**2))
+    return np.exp(-dist / ls)
 
 def nullcheck(value, default):
     """
