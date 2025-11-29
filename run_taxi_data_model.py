@@ -115,17 +115,16 @@ def run_model_with_taxi_data(csv_path: str):
         # The ZINB_GP model will be adapted to not need these pre-computed matrices
         Ds=None, # No longer needed
         Dt=None, # No longer needed
-        nsim=2000,
-        burn=1000,
+        nsim=6,
+        burn=2,
         print_progress=True
     )
-
+    
     # --- 7. Process Results ---
     logging.info("Model run completed.")
     # You can now save, plot, or analyze the results.
     # For example, printing the summary of posterior samples:
     # print(model_results['summary'])
-    # np.save("model_results.npy", model_results)
 
 
 if __name__ == '__main__':
