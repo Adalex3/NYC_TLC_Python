@@ -13,6 +13,8 @@ from src.model_module.utils import (
     noise_mix, nullcheck, sigmoid, solve_svd, mvn_sample_svd,
     kernel_s_combined, kernel_t_combined
 )
+from scipy.sparse import hstack
+from scipy.sparse import diags
 
 # ==============================================================================
 # Statistical Wrappers (to match R function signatures)
@@ -391,7 +393,10 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds_features, Dt_features, priors, nsim, burn, 
     ########
     # MCMC #
     ########
-    XV = np.hstack((X, Vs, Vt))
+    # Use sparse hstack because Vs and Vt are now sparse matrices.
+    # We convert X to a sparse format (CSR is efficient for row slicing) before stacking.
+    from scipy.sparse import csr_matrix
+    XV = hstack([csr_matrix(X), Vs, Vt])
     
     # Create the loop iterator
     iterations = range(1, nsim + 1)
@@ -425,7 +430,11 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds_features, Dt_features, priors, nsim, burn, 
         # Instead, we use the algebraic identity: X' W z = X' (y - 1/2)
         # Old (unstable): z = (y1 - 1 / 2) / w
         
-        sqrt_w_XV = np.sqrt(w)[:, None] * XV
+        # To perform row-wise scaling on the sparse matrix XV, we can't use broadcasting
+        # with a column vector. Instead, we create a sparse diagonal matrix from the
+        # weights and use matrix multiplication. diag(sqrt(w)) @ XV scales each row i
+        # of XV by sqrt(w)[i].
+        sqrt_w_XV = diags(np.sqrt(w)) @ XV
         crossprod_val = sqrt_w_XV.T @ sqrt_w_XV
 
         # --- Optimized SVD Calculation ---
@@ -516,7 +525,9 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds_features, Dt_features, priors, nsim, burn, 
         # Stable calculation: X' W z = X' (y - r)/2
         # Old (unstable): z = (y[mask_y1] - r) / (2 * w)
 
-        sqrt_w_XV_sub = np.sqrt(w)[:, None] * XV[mask_y1]
+        # Perform row-wise scaling on the sparse matrix subset using a diagonal matrix.
+        # This is the sparse-matrix equivalent of `np.sqrt(w)[:, None] * dense_matrix`.
+        sqrt_w_XV_sub = diags(np.sqrt(w)) @ XV[mask_y1]
         crossprod_val = sqrt_w_XV_sub.T @ sqrt_w_XV_sub
 
         # --- Optimized SVD Calculation ---

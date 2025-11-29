@@ -34,17 +34,19 @@ def make_y_Vs_Vt(obs_matrix):
     # Python is 0-indexed, so we construct indices 0 to N-1
     row_indices = np.arange(N)
     col_indices_t = np.repeat(np.arange(n_temporal), n_spatial)
-    Vt = coo_matrix((np.ones(N), (row_indices, col_indices_t)), shape=(N, n_temporal)).toarray()
+    Vt = coo_matrix((np.ones(N), (row_indices, col_indices_t)), shape=(N, n_temporal))
 
     # Vs <- as.matrix(sparseMatrix(i = 1:N, j = rep(1:n_spatial, n_temporal), x=rep(1,N)))
     col_indices_s = np.tile(np.arange(n_spatial), n_temporal)
-    Vs = coo_matrix((np.ones(N), (row_indices, col_indices_s)), shape=(N, n_spatial)).toarray()
+    Vs = coo_matrix((np.ones(N), (row_indices, col_indices_s)), shape=(N, n_spatial))
 
     # Sacrifice to the intercept gods
     # Vt <- Vt[,2:ncol(Vt)]
-    Vt = Vt[:, 1:]
+    # Convert to CSR format which supports efficient slicing
+    Vt = Vt.tocsr()[:, 1:]
     # Vs <- Vs[,2:ncol(Vs)]
-    Vs = Vs[:, 1:]
+    # Convert to CSR format which supports efficient slicing
+    Vs = Vs.tocsr()[:, 1:]
 
     return {'Vs': Vs, 'Vt': Vt, 'y': y}
 
