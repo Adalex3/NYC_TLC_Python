@@ -2,6 +2,7 @@
 import pandas as pd
 import numpy as np
 from scipy.spatial.distance import pdist, squareform
+import os
 import logging
 
 from src.model_module.core import ZINB_GP
@@ -121,11 +122,47 @@ def run_model_with_taxi_data(csv_path: str):
     )
     
     # --- 7. Process Results ---
-    logging.info("Model run completed.")
-    # You can now save, plot, or analyze the results.
-    # For example, printing the summary of posterior samples:
-    # print(model_results['summary'])
+    summarize_and_save_results(model_results, "model_results.npz")
 
+def summarize_and_save_results(results: dict, output_path: str):
+    """
+    Saves model results to a compressed .npz file and prints summary statistics
+    for key hyperparameters.
+
+    Args:
+        results (dict): The dictionary of posterior samples from the model.
+        output_path (str): The path to save the .npz file.
+    """
+    logging.info(f"Saving model results to {output_path}...")
+    np.savez_compressed(output_path, **results)
+    logging.info(f"Results saved successfully to {os.path.abspath(output_path)}")
+
+    logging.info("--- Posterior Summary Statistics for Key Hyperparameters ---")
+    
+    # Define which scalar parameters to summarize
+    params_to_summarize = [
+        'Sigma1s', 'Noise1s', 'Sigma2s', 'Noise2s',
+        'Sigma1t', 'Noise1t', 'Sigma2t', 'Noise2t', 'R'
+    ]
+
+    for param in params_to_summarize:
+        if param in results:
+            samples = results[param]
+            mean = np.mean(samples)
+            std = np.std(samples)
+            quantiles = np.quantile(samples, [0.025, 0.5, 0.975])
+            logging.info(
+                f"  {param:<10}: Mean={mean:8.4f}, StdDev={std:8.4f}, "
+                f"95% CI=({quantiles[0]:8.4f}, {quantiles[2]:8.4f})"
+            )
+
+    # Special handling for vector parameters like length scales
+    for param_prefix in ['L1s', 'L2s', 'L1t', 'L2t']:
+        if param_prefix in results:
+            samples = results[param_prefix]
+            for i in range(samples.shape[1]):
+                mean = np.mean(samples[:, i])
+                logging.info(f"  {param_prefix}[{i}]   : Mean={mean:8.4f}")
 
 if __name__ == '__main__':
     # !!! IMPORTANT !!!
