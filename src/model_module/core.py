@@ -25,6 +25,11 @@ def rtnorm(n, mean, sd, lower, upper):
 
 def dtnorm(x, mean, sd, lower, upper, log=False):
     """Wrapper for truncated normal density matching R's msm::dtnorm"""
+    # Ensure inputs are numpy arrays to handle both scalar and vector/tuple inputs for ARD kernels
+    x = np.asarray(x)
+    mean = np.asarray(mean)
+    sd = np.asarray(sd)
+    
     a, b = (lower - mean) / sd, (upper - mean) / sd
     if log:
         return truncnorm.logpdf(x, a, b, loc=mean, scale=sd)
