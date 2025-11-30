@@ -296,29 +296,37 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds_features, Dt_features, priors, nsim, burn, 
     y_ind = np.zeros(N) 
     y_ind[y != 0] = 1
 
-    m1 = sm.GLM(y_ind, X, family=Binomial()).fit()
-    alpha1 = m1.params
-    logger.debug(f"Initial alpha from GLM (Binomial): {alpha1}")
+    # If there are fixed effects, get initial values from GLMs.
+    if p > 0:
+        m1 = sm.GLM(y_ind, X, family=Binomial()).fit()
+        alpha1 = m1.params
+        logger.debug(f"Initial alpha from GLM (Binomial): {alpha1}")
 
-    mask_nz = (y != 0)
-    if np.sum(mask_nz) > 0:
-        try:
-            # Try to fit a Negative Binomial GLM for a good starting point.
-            # This can be numerically unstable if the data subset is difficult.
-            m2 = NegativeBinomial(y[mask_nz], X[mask_nz], loglike_method='nb2').fit(disp=0, maxiter=100)
-            beta = m2.params[:-1] # Exclude the dispersion parameter alpha from statsmodels
-            if np.any(np.isnan(beta)):
-                logger.warning("GLM for initial beta resulted in NaNs. Defaulting to zeros.")
+        mask_nz = (y != 0)
+        if np.sum(mask_nz) > 0:
+            try:
+                # Try to fit a Negative Binomial GLM for a good starting point.
+                # This can be numerically unstable if the data subset is difficult.
+                m2 = NegativeBinomial(y[mask_nz], X[mask_nz], loglike_method='nb2').fit(disp=0, maxiter=100)
+                beta = m2.params[:-1] # Exclude the dispersion parameter alpha from statsmodels
+                if np.any(np.isnan(beta)):
+                    logger.warning("GLM for initial beta resulted in NaNs. Defaulting to zeros.")
+                    beta = np.zeros(p)
+            except Exception as e:
+                logger.warning(f"Could not fit initial GLM for beta, defaulting to zeros. Error: {e}")
                 beta = np.zeros(p)
-        except Exception as e:
-            logger.warning(f"Could not fit initial GLM for beta, defaulting to zeros. Error: {e}")
+        else:
             beta = np.zeros(p)
     else:
+        # If p=0 (no fixed effects), initialize alpha and beta as empty arrays.
+        alpha1 = np.array([])
         beta = np.zeros(p)
+
     logger.debug(f"Initial beta: {beta}")
     
-    eta1 = X @ alpha1 + 0 
-    eta2 = X @ beta + 0 
+    # The terms X @ alpha1 and X @ beta will correctly be zero if p=0
+    eta1 = (X @ alpha1) if p > 0 else 0
+    eta2 = (X @ beta) if p > 0 else 0
     p_at_risk = sigmoid(eta1) 
 
     q = 1 / (1 + np.exp(eta2))
@@ -327,8 +335,12 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds_features, Dt_features, priors, nsim, burn, 
     mask_z = (y == 0)
     y1[mask_z] = np.random.binomial(1, theta[mask_z])
 
-    m1 = sm.GLM(y1, X, family=Binomial()).fit()
-    alpha = m1.params
+    if p > 0:
+        m1 = sm.GLM(y1, X, family=Binomial()).fit()
+        alpha = m1.params
+    else:
+        alpha = np.array([])
+
     logger.debug(f"Refined initial alpha after sampling y1: {alpha}")
 
     noise_ratio_t1 = 0.5
@@ -463,7 +475,10 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds_features, Dt_features, priors, nsim, burn, 
         # -----------------------------------------------------
         # Update alpha, a, b (Logistic Component)
         # -----------------------------------------------------
-        mu = X @ alpha + Vs @ a + Vt @ b
+        if p > 0:
+            mu = X @ alpha + Vs @ a + Vt @ b
+        else:
+            mu = Vs @ a + Vt @ b
         w = rpg(N, 1, mu) 
         
         logger.debug(f"Iter {i}: Logistic - mu shape: {mu.shape}, w shape: {w.shape}")
@@ -504,8 +519,12 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds_features, Dt_features, priors, nsim, burn, 
         # Update at-risk indicator y1
         # -----------------------------------------------------
         logger.debug(f"Iter {i}: Updating at-risk indicator y1.")
-        eta1 = X @ alpha + Vs @ a + Vt @ b
-        eta2 = X @ beta + Vs @ c + Vt @ d 
+        if p > 0:
+            eta1 = X @ alpha + Vs @ a + Vt @ b
+            eta2 = X @ beta + Vs @ c + Vt @ d
+        else:
+            eta1 = Vs @ a + Vt @ b
+            eta2 = Vs @ c + Vt @ d
         pi_val = sigmoid(eta1) 
         q = 1 / (1 + np.exp(eta2)) 
         theta = pi_val * (q**r) / (pi_val * (q**r) + 1 - pi_val) 
@@ -559,7 +578,10 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds_features, Dt_features, priors, nsim, burn, 
         # Update beta, c, d (Count Component)
         # -----------------------------------------------------
         logger.debug(f"Iter {i}: Updating count component parameters (beta, c, d). N1={N1}")
-        eta = X[mask_y1] @ beta + Vs[mask_y1] @ c + Vt[mask_y1] @ d
+        if p > 0:
+            eta = X[mask_y1] @ beta + Vs[mask_y1] @ c + Vt[mask_y1] @ d
+        else:
+            eta = Vs[mask_y1] @ c + Vt[mask_y1] @ d
         w = rpg(N1, y[mask_y1] + r, eta)
         
         logger.debug(f"Iter {i}: Count - eta shape: {eta.shape}, w shape: {w.shape}")
