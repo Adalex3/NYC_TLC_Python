@@ -57,11 +57,8 @@ def predict_scenario(
     if not np.any(time_matches):
         raise ValueError(f"Time scenario (weekend={is_weekend}, hour={hour}) not found in model's temporal features.")
     
-    # Create a dummy observation matrix for this single time slice to generate Vs and Vt
-    # This ensures the random effects are mapped correctly.
-    obs_matrix_pred = np.zeros((n_locs, time_features.shape[0]))
-    struct = make_y_Vs_Vt(obs_matrix_pred)
-    Vs_pred, Vt_pred = struct['Vs'], struct['Vt']
+    # The model dropped the first time point, so we subtract 1 from the index
+    time_idx = np.where(time_matches)[0][0] - 1
 
     # --- 3. Calculate Linear Predictors (eta1, eta2) ---
     # Get posterior means of parameters
@@ -69,11 +66,14 @@ def predict_scenario(
     a, c = posterior_means['A'], posterior_means['C']
     b, d = posterior_means['B'], posterior_means['D']
     r = posterior_means['R']
-    
-    # Correctly construct the linear predictors using the design matrices
-    # This maps the spatial and temporal effects to each location properly.
-    eta1 = X_pred.values @ alpha + Vs_pred @ a + Vt_pred @ b
-    eta2 = X_pred.values @ beta + Vs_pred @ c + Vt_pred @ d
+
+    # Reconstruct the full spatial random effects. The model uses a sum-to-zero
+    # constraint by dropping the first location's effect. We prepend 0 to match n_locs.
+    a_full = np.insert(a, 0, 0)
+    c_full = np.insert(c, 0, 0)
+
+    eta1 = X_pred.values @ alpha + a_full + b[time_idx]
+    eta2 = X_pred.values @ beta + c_full + d[time_idx]
 
     # --- 4. Calculate Expected Ride Count ---
     # E[Y] = P(Y > 0) * E[Y | Y > 0]
