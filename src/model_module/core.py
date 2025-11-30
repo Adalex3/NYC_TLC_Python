@@ -325,8 +325,8 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds_features, Dt_features, priors, nsim, burn, 
     logger.debug(f"Initial beta: {beta}")
     
     # The terms X @ alpha1 and X @ beta will correctly be zero if p=0
-    eta1 = (X @ alpha1) if p > 0 else 0
-    eta2 = (X @ beta) if p > 0 else 0
+    eta1 = (X @ alpha1) if p > 0 else np.zeros(N)
+    eta2 = (X @ beta) if p > 0 else np.zeros(N)
     p_at_risk = sigmoid(eta1) 
 
     q = 1 / (1 + np.exp(eta2))
