@@ -124,8 +124,7 @@ def main():
     # Store original X column names for reconstructing the design matrix
     df_sorted = df.sort_values(['is_weekend', 'hour', 'grid_y', 'grid_x'])
     df_sorted['time_id'] = df_sorted['hour'] + 24 * df_sorted['is_weekend']
-    X_cols = ['intercept'] + [f"time_{i}" for i in sorted(df_sorted['time_id'].unique())[1:]]
-    posterior_means['X_cols'] = X_cols
+    posterior_means['X_cols'] = [f"time_{i}" for i in sorted(df_sorted['time_id'].unique())[1:]]
 
     # --- Generate and Save Predictions ---
     # Scenario 1: Weekday Evening Peak (5 PM)

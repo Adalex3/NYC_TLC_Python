@@ -270,13 +270,22 @@ def ZINB_GP(X, y, coords, Vs, Vt, Ds_features, Dt_features, priors, nsim, burn, 
 
     mask_nz = (y != 0)
     if np.sum(mask_nz) > 0:
-        m2 = NegativeBinomial(y[mask_nz], X[mask_nz], loglike_method='nb2').fit(disp=0)
-        beta = m2.params[:-1]
-        logger.debug(f"Initial beta from GLM (Negative Binomial): {beta}")
+        try:
+            # Try to fit a Negative Binomial GLM for a good starting point.
+            # This can be numerically unstable if the data subset is difficult.
+            m2 = NegativeBinomial(y[mask_nz], X[mask_nz], loglike_method='nb2').fit(disp=0, maxiter=100)
+            beta = m2.params[:-1] # Exclude the dispersion parameter alpha from statsmodels
+            if np.any(np.isnan(beta)):
+                logger.warning("GLM for initial beta resulted in NaNs. Defaulting to zeros.")
+                beta = np.zeros(p)
+        except Exception as e:
+            logger.warning(f"Could not fit initial GLM for beta, defaulting to zeros. Error: {e}")
+            beta = np.zeros(p)
     else:
         beta = np.zeros(p)
-
-    eta1 = X @ alpha1 + 0
+    logger.debug(f"Initial beta: {beta}")
+    
+    eta1 = X @ alpha1 + 0 
     eta2 = X @ beta + 0 
     p_at_risk = sigmoid(eta1) 
 

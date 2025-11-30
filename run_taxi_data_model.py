@@ -72,14 +72,12 @@ def run_model_with_taxi_data(csv_path: str):
     df_sorted['time_id'] = df_sorted['hour'] + 24 * df_sorted['is_weekend']
     X_dummies = pd.get_dummies(df_sorted['time_id'], drop_first=True, prefix='time')
     
-    # Add an intercept term
-    X = X_dummies.copy()
-    X['intercept'] = 1.0
-    
-    # Reorder columns to have the intercept first
-    cols = ['intercept'] + [col for col in X.columns if col != 'intercept']
-    X = X[cols]
-
+    # --- CRITICAL FIX for Identifiability ---
+    # Remove the intercept from the fixed effects design matrix X.
+    # This forces the model to use the spatial and temporal random effects to
+    # explain the baseline ride counts, preventing the fixed effects from
+    # dominating and masking the spatial variation.
+    X = X_dummies
     # Explicitly convert to a numeric dtype to avoid 'object' type arrays
     X = X.astype(np.float64)
 
@@ -116,8 +114,8 @@ def run_model_with_taxi_data(csv_path: str):
         # The ZINB_GP model will be adapted to not need these pre-computed matrices
         Ds=None, # No longer needed
         Dt=None, # No longer needed
-        nsim=6,
-        burn=2,
+        nsim=20,
+        burn=10,
         print_progress=True
     )
     
