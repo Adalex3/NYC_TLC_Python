@@ -72,8 +72,13 @@ def predict_scenario(
     a_full = np.insert(a, 0, 0)
     c_full = np.insert(c, 0, 0)
 
-    eta1 = X_pred.values @ alpha + a_full + b[time_idx]
-    eta2 = X_pred.values @ beta + c_full + d[time_idx]
+    # --- CRITICAL FIX ---
+    # The model was trained without an intercept in the fixed effects design matrix X
+    # to ensure identifiability between fixed and random effects. The random effects
+    # (a, b, c, d) capture the baseline levels. Therefore, we must also EXCLUDE the
+    # fixed effects term (X @ alpha, X @ beta) during prediction.
+    eta1 = a_full + b[time_idx]
+    eta2 = c_full + d[time_idx]
 
     # --- 4. Calculate Expected Ride Count ---
     # E[Y] = P(Y > 0) * E[Y | Y > 0]
