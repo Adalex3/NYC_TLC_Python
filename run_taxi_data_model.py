@@ -165,8 +165,6 @@ def summarize_and_save_results(results: dict, output_path: str):
                 logging.info(f"  {param_prefix}[{i}]   : Mean={mean:8.4f}")
 
 if __name__ == '__main__':
-    # !!! IMPORTANT !!!
-    # Replace this with the actual path to your CSV file.
     TAXI_DATA_CSV_PATH = 'nyc_taxi_zinb_ready.csv'
     
     run_model_with_taxi_data(TAXI_DATA_CSV_PATH)

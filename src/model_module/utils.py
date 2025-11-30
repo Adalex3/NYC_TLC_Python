@@ -219,6 +219,12 @@ def sigmoid(eta):
     """
     # eta <- pmin(700, eta)
     eta = np.minimum(700, eta)
-    # return(pmax(1e-6, pmin(1 - 1e-6, exp(eta) / (1 + exp(eta))))) 
-    val = np.exp(eta) / (1 + np.exp(eta))
+    
+    # Numerically stable implementation of sigmoid
+    # Handles large positive and negative values of eta without overflow.
+    val = np.where(
+        eta >= 0,
+        1 / (1 + np.exp(-eta)),
+        np.exp(eta) / (1 + np.exp(eta))
+    )
     return np.maximum(1e-6, np.minimum(1 - 1e-6, val))
