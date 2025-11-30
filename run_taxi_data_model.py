@@ -120,9 +120,9 @@ def run_model_with_taxi_data(csv_path: str):
     )
     
     # --- 7. Process Results ---
-    summarize_and_save_results(model_results, "model_results.npz")
+    summarize_and_save_results(model_results, X.columns.to_list(), "model_results.npz")
 
-def summarize_and_save_results(results: dict, output_path: str):
+def summarize_and_save_results(results: dict, x_cols: list, output_path: str):
     """
     Saves model results to a compressed .npz file and prints summary statistics
     for key hyperparameters.
@@ -130,8 +130,10 @@ def summarize_and_save_results(results: dict, output_path: str):
     Args:
         results (dict): The dictionary of posterior samples from the model.
         output_path (str): The path to save the .npz file.
+        x_cols (list): The column names of the design matrix X.
     """
     logging.info(f"Saving model results to {output_path}...")
+    results['X_cols'] = np.array(x_cols, dtype=object) # Save X column names
     np.savez_compressed(output_path, **results)
     logging.info(f"Results saved successfully to {os.path.abspath(output_path)}")
 
@@ -140,7 +142,7 @@ def summarize_and_save_results(results: dict, output_path: str):
     # Define which scalar parameters to summarize
     params_to_summarize = [
         'Sigma1s', 'Noise1s', 'Sigma2s', 'Noise2s',
-        'Sigma1t', 'Noise1t', 'Sigma2t', 'Noise2t', 'R'
+        'Sigma1t', 'Noise1t', 'Sigma2t', 'Noise2t', 'R',
     ]
 
     for param in params_to_summarize:

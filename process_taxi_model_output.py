@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import logging
 import os
+from src.model_module.utils import make_y_Vs_Vt
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -44,7 +45,7 @@ def predict_scenario(
     
     # Create a base DataFrame for the X matrix for all locations
     # This must match the structure from run_taxi_data_model.py (no intercept)
-    X_pred = pd.DataFrame(0, index=np.arange(n_locs), columns=posterior_means['X_cols'])
+    X_pred = pd.DataFrame(0, index=np.arange(n_locs), columns=posterior_means['X_cols'].tolist())
     if time_col_name in X_pred.columns:
         X_pred[time_col_name] = 1.0
 
@@ -56,8 +57,11 @@ def predict_scenario(
     if not np.any(time_matches):
         raise ValueError(f"Time scenario (weekend={is_weekend}, hour={hour}) not found in model's temporal features.")
     
-    # The model dropped the first time point, so we subtract 1 from the index
-    time_idx = np.where(time_matches)[0][0] - 1
+    # Create a dummy observation matrix for this single time slice to generate Vs and Vt
+    # This ensures the random effects are mapped correctly.
+    obs_matrix_pred = np.zeros((n_locs, time_features.shape[0]))
+    struct = make_y_Vs_Vt(obs_matrix_pred)
+    Vs_pred, Vt_pred = struct['Vs'], struct['Vt']
 
     # --- 3. Calculate Linear Predictors (eta1, eta2) ---
     # Get posterior means of parameters
@@ -65,18 +69,11 @@ def predict_scenario(
     a, c = posterior_means['A'], posterior_means['C']
     b, d = posterior_means['B'], posterior_means['D']
     r = posterior_means['R']
-
-    # Reconstruct the full spatial random effects. The model uses a sum-to-zero
-    # constraint by dropping the first location's effect (making it implicitly 0).
-    # We must prepend a 0 to match the full number of locations (n_locs).
-    a_full = np.insert(a, 0, 0)
-    c_full = np.insert(c, 0, 0)
-
-    b_slice = b[time_idx]
-    d_slice = d[time_idx]
-
-    eta1 = X_pred.values @ alpha + a_full + b_slice
-    eta2 = X_pred.values @ beta + c_full + d_slice
+    
+    # Correctly construct the linear predictors using the design matrices
+    # This maps the spatial and temporal effects to each location properly.
+    eta1 = X_pred.values @ alpha + Vs_pred @ a + Vt_pred @ b
+    eta2 = X_pred.values @ beta + Vs_pred @ c + Vt_pred @ d
 
     # --- 4. Calculate Expected Ride Count ---
     # E[Y] = P(Y > 0) * E[Y | Y > 0]
@@ -111,7 +108,10 @@ def main():
     results = np.load(model_results_path, allow_pickle=True)
     
     # Calculate posterior means for all parameters
-    posterior_means = {key: np.mean(results[key], axis=0) for key in results.files}
+    posterior_means = {
+        key: (np.mean(results[key], axis=0) if key != 'X_cols' else results[key])
+        for key in results.files
+    }
 
     # Load original data to get coordinate and time structures
     df = pd.read_csv(raw_data_path)
@@ -120,10 +120,7 @@ def main():
     time_features = np.array(obs_matrix.columns.to_list())
     
     # Store original X column names for reconstructing the design matrix
-    df_sorted = df.sort_values(['is_weekend', 'hour', 'grid_y', 'grid_x'])
-    df_sorted['time_id'] = df_sorted['hour'] + 24 * df_sorted['is_weekend']
-    # The design matrix in the model does NOT have an intercept.
-    posterior_means['X_cols'] = [f"time_{i}" for i in sorted(df_sorted['time_id'].unique())[1:]]
+    # This is now loaded directly from the results file.
 
     # --- Generate and Save Predictions ---
     # Scenario 1: Weekday Evening Peak (5 PM)
