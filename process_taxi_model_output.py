@@ -43,12 +43,10 @@ def predict_scenario(
     time_col_name = f"time_{time_id}"
     
     # Create a base DataFrame for the X matrix for all locations
+    # This must match the structure from run_taxi_data_model.py (no intercept)
     X_pred = pd.DataFrame(0, index=np.arange(n_locs), columns=posterior_means['X_cols'])
-    X_pred['intercept'] = 1.0
     if time_col_name in X_pred.columns:
         X_pred[time_col_name] = 1.0
-    else:
-        logging.warning(f"Time column '{time_col_name}' not found in original model design matrix. Predictions will not include this time effect.")
 
     # --- 2. Identify the Temporal Random Effect Index ---
     # Find the index corresponding to our time scenario in the original temporal features
@@ -124,8 +122,8 @@ def main():
     # Store original X column names for reconstructing the design matrix
     df_sorted = df.sort_values(['is_weekend', 'hour', 'grid_y', 'grid_x'])
     df_sorted['time_id'] = df_sorted['hour'] + 24 * df_sorted['is_weekend']
-    # The design matrix in the model includes an intercept first, then the time effects
-    posterior_means['X_cols'] = ['intercept'] + [f"time_{i}" for i in sorted(df_sorted['time_id'].unique())[1:]]
+    # The design matrix in the model does NOT have an intercept.
+    posterior_means['X_cols'] = [f"time_{i}" for i in sorted(df_sorted['time_id'].unique())[1:]]
 
     # --- Generate and Save Predictions ---
     # Scenario 1: Weekday Evening Peak (5 PM)
