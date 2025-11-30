@@ -67,19 +67,13 @@ def run_model_with_taxi_data(csv_path: str):
     # `make_y_Vs_Vt` flattens by columns, which are (is_weekend, hour).
     df_sorted = df.sort_values(['is_weekend', 'hour', 'grid_y', 'grid_x'])
 
-    # Use one-hot encoding on the time_id to create the design matrix X.
-    # This automatically handles the differentiation of weekday and weekend hours.
-    df_sorted['time_id'] = df_sorted['hour'] + 24 * df_sorted['is_weekend']
-    X_dummies = pd.get_dummies(df_sorted['time_id'], drop_first=True, prefix='time')
-    
     # --- CRITICAL FIX for Identifiability ---
-    # Remove the intercept from the fixed effects design matrix X.
-    # This forces the model to use the spatial and temporal random effects to
-    # explain the baseline ride counts, preventing the fixed effects from
-    # dominating and masking the spatial variation.
-    X = X_dummies
-    # Explicitly convert to a numeric dtype to avoid 'object' type arrays
-    X = X.astype(np.float64)
+    # To ensure identifiability between the fixed effects (alpha, beta) and the
+    # spatial/temporal random effects (a,b,c,d), we must remove the redundant
+    # time-based fixed effects. The model should learn the baseline rates through
+    # the random effects. We achieve this by using an empty design matrix for X.
+    # The model's core logic is robust to a zero-column X matrix.
+    X = pd.DataFrame(index=df_sorted.index)
 
     # --- 6. Verify Shapes and Run the Model ---
     logging.info("Verification of matrix shapes:")
