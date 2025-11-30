@@ -49,11 +49,30 @@ def dbeta(x, shape1, shape2, log=False):
         return beta.logpdf(x, shape1, shape2)
     return beta.pdf(x, shape1, shape2)
 
-def dmvnorm(x, mean, sigma, log=False):
-    """Wrapper for MVN density matching R's mvtnorm::dmvnorm"""
+def dmvnorm(x, mean, sigma, log=False, chol_sigma=None):
+    """
+    Wrapper for MVN density matching R's mvtnorm::dmvnorm.
+    Optimized to use a pre-computed Cholesky factor of the covariance matrix if provided.
+    """
+    # If Cholesky factor is not provided, fall back to the standard SciPy implementation.
+    if chol_sigma is None:
+        if log:
+            return multivariate_normal.logpdf(x, mean=mean, cov=sigma)
+        return multivariate_normal.pdf(x, mean=mean, cov=sigma)
+
+    # Optimized path using Cholesky decomposition L, where sigma = L @ L.T
+    L = chol_sigma
+    k = len(x)
+    dev = x - mean
+    
+    # Solve L @ v = dev, then v = L_inv @ dev
+    v = np.linalg.solve(L, dev)
+    log_det_sigma = 2 * np.sum(np.log(np.diag(L)))
+    log_pdf = -0.5 * (k * np.log(2 * np.pi) + log_det_sigma + v.T @ v)
+
     if log:
-        return multivariate_normal.logpdf(x, mean=mean, cov=sigma)
-    return multivariate_normal.pdf(x, mean=mean, cov=sigma)
+        return log_pdf
+    return np.exp(log_pdf)
 
 def rinvgamma(n, shape, scale):
     """Wrapper for Inverse Gamma sampling matching LaplacesDemon::rinvgamma"""
@@ -128,9 +147,19 @@ def update_ls_sigma_noise(ls, sigma, noise_ratio, gpdraw, K, features, lsPrior, 
     
     zero_mean = np.zeros(len(gpdraw))
     try:
-        likelihood_ls = dmvnorm(gpdraw, mean=zero_mean, sigma=K_star, log=True) - \
-                        dmvnorm(gpdraw, mean=zero_mean, sigma=K, log=True)
-        
+        # --- Optimization ---
+        # Compute the Cholesky factor of the current kernel matrix K once.
+        # This avoids re-computing it in both the ls and noise_ratio update steps.
+        L = np.linalg.cholesky(K)
+
+        # --- Optimization ---
+        # Pre-compute the Cholesky decomposition of the proposal kernel matrix.
+        # This avoids a costly O(n^3) decomposition inside dmvnorm.
+        L_star = np.linalg.cholesky(K_star)
+        # Pass the pre-computed Cholesky factors to dmvnorm.
+        likelihood_ls = dmvnorm(gpdraw, mean=zero_mean, sigma=K_star, log=True, chol_sigma=L_star) - \
+                        dmvnorm(gpdraw, mean=zero_mean, sigma=K, log=True, chol_sigma=L)
+
         prior_ls = np.sum(dgamma(proposal, shape=lsPrior['a'], rate=lsPrior['b'], log=True)) - \
                    np.sum(dgamma(ls, shape=lsPrior['a'], rate=lsPrior['b'], log=True))
         
@@ -158,8 +187,11 @@ def update_ls_sigma_noise(ls, sigma, noise_ratio, gpdraw, K, features, lsPrior, 
     K_star = sigma**2 * noise_mix(kernel_func(features, ls), proposal)
     
     try:
-        likelihood_nr = dmvnorm(gpdraw, mean=np.zeros(len(gpdraw)), sigma=K_star, log=True) - \
-                        dmvnorm(gpdraw, mean=np.zeros(len(gpdraw)), sigma=K, log=True)
+        # --- Optimization ---
+        # Reuse the pre-computed Cholesky factor 'L' for the current kernel K.
+        L_star = np.linalg.cholesky(K_star)
+        likelihood_nr = dmvnorm(gpdraw, mean=zero_mean, sigma=K_star, log=True, chol_sigma=L_star) - \
+                        dmvnorm(gpdraw, mean=zero_mean, sigma=K, log=True, chol_sigma=L)
 
         prior_nr = dbeta(proposal, shape1=noisePrior['a'], shape2=noisePrior['b'], log=True) - \
                    dbeta(noise_ratio, shape1=noisePrior['a'], shape2=noisePrior['b'], log=True)
