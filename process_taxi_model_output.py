@@ -15,6 +15,37 @@ def sigmoid(eta):
     val = 1 / (1 + np.exp(-eta))
     return np.maximum(1e-6, np.minimum(1 - 1e-6, val))
 
+def print_parameter_summary(posterior_means: dict):
+    """
+    Prints a summary of the posterior mean estimates for key model parameters.
+
+    This helps diagnose model behavior, such as why predictions might be constant.
+    If the variance of spatial/temporal effects is near zero, it indicates the
+    model did not find evidence for spatial or temporal variation.
+
+    Args:
+        posterior_means (dict): Dictionary of posterior mean values for model parameters.
+    """
+    logging.info("--- Posterior Mean Parameter Summary ---")
+
+    # Summarize key random effects vectors
+    for name, param in [('Spatial Logistic (a)', 'A'),
+                        ('Temporal Logistic (b)', 'B'),
+                        ('Spatial Count (c)', 'C'),
+                        ('Temporal Count (d)', 'D')]:
+        if param in posterior_means:
+            effects = posterior_means[param]
+            summary_stats = (
+                f"Mean={np.mean(effects):.4f}, StdDev={np.std(effects):.4f}, "
+                f"Min={np.min(effects):.4f}, Max={np.max(effects):.4f}"
+            )
+            logging.info(f"  {name:<22}: {summary_stats}")
+
+    # Print the scalar dispersion parameter
+    if 'R' in posterior_means:
+        logging.info(f"  {'Dispersion (r)':<22}: Mean={posterior_means['R']:.4f}")
+
+
 def predict_scenario(
     coords: np.ndarray,
     time_features: np.ndarray,
@@ -117,6 +148,9 @@ def main():
         key: (np.mean(results[key], axis=0) if key != 'X_cols' else results[key])
         for key in results.files
     }
+
+    # Print a summary of the learned parameters to diagnose model behavior
+    print_parameter_summary(posterior_means)
 
     # Load original data to get coordinate and time structures
     df = pd.read_csv(raw_data_path)
